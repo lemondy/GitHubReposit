@@ -1,0 +1,899 @@
+# HG changeset patch
+# Parent 84975e4930dd0f5a08101f6af726477279f7192c
+
+diff --git a/misc/cgo/testshared/main.c b/misc/cgo/testshared/main.c
+new file mode 100644
+--- /dev/null
++++ b/misc/cgo/testshared/main.c
+@@ -0,0 +1,18 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include <stdio.h>
++
++extern int Go_callback(void);
++extern void Go_testEnv(void);
++
++int main() {
++	int v = Go_callback();
++	if(v != 42) {
++		fprintf(stderr, "Incorrect result from Go_callback, expected %d, got %d\n", 42, v);
++		return 1;
++	}
++	Go_testEnv();
++	return 0;
++}
+diff --git a/misc/cgo/testshared/mainadv.c b/misc/cgo/testshared/mainadv.c
+new file mode 100644
+--- /dev/null
++++ b/misc/cgo/testshared/mainadv.c
+@@ -0,0 +1,67 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include <stdio.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++
++static __thread int tlsvar;
++
++static void *threaded_callback(void *callback) {
++	int v = ((int (*)(void))(callback))();
++	if(v != 42) {
++		fprintf(stderr, "Incorrect result from Go function, expected %d, got %d\n", 42, v);
++		exit(1);
++	}
++	return NULL;
++}
++
++int main() {
++	void *handle;
++	int (*callback)(void);
++	char *error;
++	int err;
++	pthread_attr_t attr;
++	pthread_t p;
++
++	tlsvar = 1234;
++
++	handle = dlopen("libgoshared.so", RTLD_LAZY);
++	if(!handle) {
++		fprintf(stderr, "Failed to load go shared library: %s\n", dlerror());
++		return 1;
++	}
++
++	callback = (int (*)(void))dlsym(handle, "Go_callback");
++	if((error = dlerror()) != NULL)  {
++		fprintf(stderr, "Failed to find callback symbol: %s\n", error);
++		return 1;
++	}
++
++	pthread_attr_init(&attr);
++	err = pthread_create(&p, &attr, threaded_callback, callback);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_create failed: %s\n", strerror(err));
++		exit(1);
++	}
++	int v = (*callback)();
++	if(v != 42) {
++		fprintf(stderr, "Incorrect result from Go function, expected %d, got %d\n", 42, v);
++		exit(1);
++	}
++
++	err = pthread_join(p, NULL);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_join failed: %s\n", strerror(err));
++		exit(1);
++	}
++	if(tlsvar != 1234) {
++		fprintf(stderr, "Corrupt TLS variable, expected %d, got %d\n", 1234, tlsvar);
++		exit(1);
++	}
++
++	exit(0);
++}
+diff --git a/misc/cgo/testshared/mainmult.c b/misc/cgo/testshared/mainmult.c
+new file mode 100644
+--- /dev/null
++++ b/misc/cgo/testshared/mainmult.c
+@@ -0,0 +1,14 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include <stdio.h>
++
++extern int Go_callback(void);
++extern int Go_callback2(void);
++
++int main() {
++	Go_callback();
++	Go_callback2();
++	return 0;
++}
+diff --git a/misc/cgo/testshared/shared.go b/misc/cgo/testshared/shared.go
+new file mode 100644
+--- /dev/null
++++ b/misc/cgo/testshared/shared.go
+@@ -0,0 +1,34 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package main
++
++import "C"
++
++import (
++	"fmt"
++	"os"
++	"time"
++)
++
++var v int
++
++//export Go_callback
++func Go_callback() int {
++	// Sleep a little to allow to test concurrent runtime initialization from mainadv.c
++	time.Sleep(200 * time.Millisecond)
++	return v
++}
++
++//export Go_testEnv
++func Go_testEnv() {
++	env := os.Getenv("TEST_ENV")
++	if env != "test" {
++		panic(fmt.Errorf("Expected TEST_ENV=%s, but got %s", "test", env))
++	}
++}
++
++func main() {
++	v = 42
++}
+diff --git a/misc/cgo/testshared/shared2.go b/misc/cgo/testshared/shared2.go
+new file mode 100644
+--- /dev/null
++++ b/misc/cgo/testshared/shared2.go
+@@ -0,0 +1,18 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package main
++
++import "C"
++
++var v int
++
++//export Go_callback2
++func Go_callback2() int {
++	return v
++}
++
++func main() {
++	v = 43
++}
+diff --git a/misc/cgo/testshared/test.bash b/misc/cgo/testshared/test.bash
+new file mode 100755
+--- /dev/null
++++ b/misc/cgo/testshared/test.bash
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++# Copyright 2011 The Go Authors.  All rights reserved.
++# Use of this source code is governed by a BSD-style
++# license that can be found in the LICENSE file.
++
++# This test is not part of the standard test suite, because shared library mode requires special compilation
++# flags on amd64 and i386.
++#
++# To enable shared library mode on linux/amd64, build the standard library with
++#
++# GO_GCFLAGS=-largemodel GO_CCFLAGS=-largemodel ./all.bash
++#
++# To enable shared library mode on linux/arm, build the standard library as normal.
++
++set -e
++
++args=
++dyld_envvar=LD_LIBRARY_PATH
++ext=so
++if [ "$(uname)" == "Darwin" ]; then
++	args="-undefined suppress -flat_namespace"
++	dyld_envvar=DYLD_LIBRARY_PATH
++	ext=dylib
++fi
++
++dylibname=goshared
++dylibname2=goshared2
++dylib="lib$dylibname.$ext"
++dylib2="lib$dylibname2.$ext"
++[ `go env GOARCH` == "amd64" ] && go_flags='-ccflags "-largemodel" -gcflags "-largemodel"'
++go build -ldflags "-shared -extldflags -L." $go_flags  -o $dylib shared.go
++go build -ldflags "-shared -extldflags -L." $go_flags -o $dylib2 shared2.go
++$(go env CC) $(go env GOGCCFLAGS) $args -o main main.c -L. -l$dylibname
++$(go env CC) $(go env GOGCCFLAGS) $args -o mainmult mainmult.c -ldl -L. -l$dylibname -l$dylibname2
++$(go env CC) $(go env GOGCCFLAGS) $args -o mainadv mainadv.c -ldl
++
++TEST_ENV=test eval "$dyld_envvar"=. ./main
++eval "$dyld_envvar"=. ./mainadv
++if eval "$dyld_envvar"=. ./mainmult; then
++	exit 1;
++fi
++rm -rf $dylib $dylib2 mainmult main mainadv *.dSYM
+diff --git a/src/cmd/cgo/out.go b/src/cmd/cgo/out.go
+--- a/src/cmd/cgo/out.go
++++ b/src/cmd/cgo/out.go
+@@ -512,7 +512,7 @@
+ 
+ 	// Gcc wrapper unpacks the C argument struct
+ 	// and calls the actual C function.
+-	fmt.Fprintf(fgcc, "void\n")
++	fmt.Fprintf(fgcc, "__attribute__ ((visibility (\"hidden\"))) void\n")
+ 	fmt.Fprintf(fgcc, "_cgo%s%s(void *v)\n", cPrefix, n.Mangle)
+ 	fmt.Fprintf(fgcc, "{\n")
+ 	if n.AddError {
+diff --git a/src/pkg/runtime/asm_386.s b/src/pkg/runtime/asm_386.s
+--- a/src/pkg/runtime/asm_386.s
++++ b/src/pkg/runtime/asm_386.s
+@@ -1353,3 +1353,8 @@
+ 	SETEQ	CX	// 1 if alen == blen
+ 	LEAL	-1(CX)(AX*2), AX	// 1,0,-1 result
+ 	RET
++
++// Not implemented on 386 yet
++TEXT runtime·lib_init(SB),NOSPLIT,$-4
++	MOVW	$0, AX
++	MOVW	(AX), AX
+diff --git a/src/pkg/runtime/asm_amd64.s b/src/pkg/runtime/asm_amd64.s
+--- a/src/pkg/runtime/asm_amd64.s
++++ b/src/pkg/runtime/asm_amd64.s
+@@ -88,7 +88,8 @@
+ 	CALL	runtime·schedinit(SB)
+ 
+ 	// create a new goroutine to start program
+-	PUSHQ	$runtime·main·f(SB)		// entry
++	MOVQ	$runtime·main·f(SB),AX
++	PUSHQ	AX		// entry
+ 	PUSHQ	$0			// arg size
+ 	ARGSIZE(16)
+ 	CALL	runtime·newproc(SB)
+@@ -246,7 +247,8 @@
+ 	
+ 	// Save our own state as the PC and SP to restore
+ 	// if this goroutine needs to be restarted.
+-	MOVQ	$runtime·newstackcall(SB), (g_sched+gobuf_pc)(AX)
++	MOVQ	$runtime·newstackcall(SB), DX
++	MOVQ	DX, (g_sched+gobuf_pc)(AX)
+ 	MOVQ	SP, (g_sched+gobuf_sp)(AX)
+ 
+ 	// Set up morestack arguments to call f on a new stack.
+@@ -878,7 +880,8 @@
+ 	// a page boundary, so we can load it directly.
+ 	MOVOU	(AX), X1
+ 	ADDQ	CX, CX
+-	PAND	masks<>(SB)(CX*8), X1
++	MOVQ    $masks<>(SB), AX
++	PAND    (AX)(CX*8), X1
+ 	JMP	partial
+ highpartial:
+ 	// address ends in 1111xxxx.  Might be up against
+@@ -886,7 +889,8 @@
+ 	// Then shift bytes down using pshufb.
+ 	MOVOU	-16(AX)(CX*1), X1
+ 	ADDQ	CX, CX
+-	PSHUFB	shifts<>(SB)(CX*8), X1
++	MOVQ    $shifts<>(SB), AX
++	PSHUFB  (AX)(CX*8), X1
+ partial:
+ 	// incorporate partial block into hash
+ 	AESENC	X3, X0
+@@ -1221,6 +1225,11 @@
+ 	LEAQ	-1(CX)(AX*2), AX	// 1,0,-1 result
+ 	RET
+ 
++TEXT runtime·lib_init(SB),NOSPLIT,$-8
++	MOVQ    _cgo_lib_init(SB), AX
++	CALL	AX
++	RET
++
+ TEXT bytes·IndexByte(SB),NOSPLIT,$0
+ 	MOVQ s+0(FP), SI
+ 	MOVQ s_len+8(FP), BX
+diff --git a/src/pkg/runtime/asm_arm.s b/src/pkg/runtime/asm_arm.s
+--- a/src/pkg/runtime/asm_arm.s
++++ b/src/pkg/runtime/asm_arm.s
+@@ -648,6 +648,10 @@
+ 	MOVW	R1, g
+ 	B		runtime·save_gm(SB)
+ 
++TEXT runtime·lib_init(SB),NOSPLIT,$0
++	MOVW    _cgo_lib_init(SB), R4
++	BL		(R4)
++	RET
+ 
+ // TODO: share code with memeq?
+ TEXT bytes·Equal(SB),NOSPLIT,$0
+diff --git a/src/pkg/runtime/cgo/gcc_sharedlib_linux.c b/src/pkg/runtime/cgo/gcc_sharedlib_linux.c
+new file mode 100644
+--- /dev/null
++++ b/src/pkg/runtime/cgo/gcc_sharedlib_linux.c
+@@ -0,0 +1,130 @@
++// Copyright 2009 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// cgo glue for initializing the Go runtime in shared library mode
++
++#include <pthread.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h> // strerror
++#include <sys/mman.h>
++#include <unistd.h>
++
++static pthread_mutex_t wait_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t wait_cond = PTHREAD_COND_INITIALIZER;
++static pthread_once_t init_once = PTHREAD_ONCE_INIT;
++static int init_done;
++
++typedef void (*MainFunc)(int, char**);
++static MainFunc runtime_main;
++
++char**
++x_cgo_getenviron(void)
++{
++	extern char** environ;
++	return environ;
++}
++
++void
++x_cgo_lib_init_done(void *v)
++{
++	int err;
++
++	err = pthread_mutex_lock(&wait_mu);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_mutex_lock failed: %s\n", strerror(err));
++		abort();
++	}
++
++	init_done = 1;
++
++	err = pthread_cond_broadcast(&wait_cond);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_cond_broadcast failed: %s\n", strerror(err));
++		abort();
++	}
++	err = pthread_mutex_unlock(&wait_mu);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_mutex_unlock failed: %s\n", strerror(err));
++		abort();
++	}
++}
++
++static void*
++lib_init_entry(void* v)
++{
++	runtime_main(0, NULL);
++
++	return NULL;
++}
++
++static void
++x_cgo_lib_init_once(void)
++{
++	pthread_attr_t attr;
++	pthread_t p;
++	int err;
++	long ps;
++	void *map;
++	void *guard_addr;
++
++	ps = sysconf(_SC_PAGESIZE);
++	if(ps == -1) {
++		fprintf(stderr, "runtime/cgo: failed to query page size\n");
++		abort();
++	}
++	if(sizeof(void *) > 4)
++		guard_addr = (void*)(0x00d0ULL<<32);
++	else
++		guard_addr = (void*)(0xa0000000);
++	map = mmap(guard_addr, ps, PROT_READ, MAP_ANON|MAP_PRIVATE, -1, 0);
++	if(map == MAP_FAILED || map != guard_addr) {
++		fprintf(stderr, "runtime/cgo: failed to map guard page (%p) (multiple go shared libraries in the same process is not supported)\n", guard_addr);
++		abort();
++	}
++
++	pthread_attr_init(&attr);
++	err = pthread_create(&p, &attr, lib_init_entry, runtime_main);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_create failed: %s\n", strerror(err));
++		abort();
++	}
++
++	err = pthread_mutex_lock(&wait_mu);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_mutex_lock failed: %s\n", strerror(err));
++		abort();
++	}
++	do {
++		err = pthread_cond_wait(&wait_cond, &wait_mu);
++		if(err != 0) {
++			fprintf(stderr, "runtime/cgo: pthread_cond_wait failed: %s\n", strerror(err));
++			abort();
++		}
++	} while (!init_done);
++	err = pthread_mutex_unlock(&wait_mu);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_mutex_unlock failed: %s\n", strerror(err));
++		abort();
++	}
++}
++
++void
++x_cgo_lib_setup(MainFunc main_func)
++{
++	runtime_main = main_func;
++}
++
++void
++x_cgo_lib_init(void)
++{
++	int err;
++
++	err = pthread_once(&init_once, x_cgo_lib_init_once);
++	if(err != 0) {
++		fprintf(stderr, "runtime/cgo: pthread_once failed: %s\n", strerror(err));
++		abort();
++	}
++}
++
+diff --git a/src/pkg/runtime/cgo/libcgo.h b/src/pkg/runtime/cgo/libcgo.h
+--- a/src/pkg/runtime/cgo/libcgo.h
++++ b/src/pkg/runtime/cgo/libcgo.h
+@@ -38,6 +38,16 @@
+ };
+ 
+ /*
++ * Initializes the runtime in shared library mode (OS, arch dependent)
++ */
++extern void (*_cgo_lib_init)(void (*fn)(void*));
++
++/*
++ * Complete runtime initialization in shared library mode (OS, arch dependent)
++ */
++extern void (*_cgo_lib_init_done)(void (*fn)(void*));
++
++/*
+  * Called by 5c/6c/8c world.
+  * Makes a local copy of the ThreadStart and
+  * calls _cgo_sys_thread_start(ts).
+diff --git a/src/pkg/runtime/cgo/sharedlib_linux.c b/src/pkg/runtime/cgo/sharedlib_linux.c
+new file mode 100644
+--- /dev/null
++++ b/src/pkg/runtime/cgo/sharedlib_linux.c
+@@ -0,0 +1,22 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include "../runtime.h"
++#include "../cgocall.h"
++
++#pragma cgo_import_static x_cgo_lib_setup
++extern void x_cgo_lib_setup(void (*)(void*));
++void (*_cgo_lib_setup)(void (*)(void*)) = x_cgo_lib_setup;
++
++#pragma cgo_import_static x_cgo_lib_init
++extern void x_cgo_lib_init(void);
++void (*_cgo_lib_init)(void) = x_cgo_lib_init;
++
++#pragma cgo_import_static x_cgo_lib_init_done
++extern void x_cgo_lib_init_done(void (*)(void*));
++void (*_cgo_lib_init_done)(void (*)(void*)) = x_cgo_lib_init_done;
++
++#pragma cgo_import_static x_cgo_getenviron
++extern uint8** x_cgo_getenviron(void);
++uint8** (*_cgo_getenviron)(void) = x_cgo_getenviron;
+diff --git a/src/pkg/runtime/os_linux_arm.c b/src/pkg/runtime/os_linux_arm.c
+--- a/src/pkg/runtime/os_linux_arm.c
++++ b/src/pkg/runtime/os_linux_arm.c
+@@ -34,13 +34,88 @@
+ }
+ 
+ #pragma textflag NOSPLIT
+-void
+-runtime·setup_auxv(int32 argc, byte **argv)
++static void
++parse_auxv_entry(uint32 key, uint32 val) {
++	byte *rnd;
++	uint32 t;
++
++	switch(key) {
++	case AT_RANDOM: // kernel provided 16-byte worth of random data
++		if(val) {
++			rnd = (byte*)val;
++			runtime·randomNumber = rnd[4] | rnd[5]<<8 | rnd[6]<<16 | rnd[7]<<24;
++		}
++		break;
++	case AT_PLATFORM: // v5l, v6l, v7l
++		if(val) {
++			t = *(uint8*)(val+1);
++			if(t >= '5' && t <= '7')
++				runtime·armArch = t - '0';
++		}
++		break;
++	case AT_HWCAP: // CPU capability bit flags
++		runtime·hwcap = val;
++		break;
++	}
++}
++	
++static uint8 *vfp = (uint8*)"vfpv3";
++
++#pragma textflag NOSPLIT
++static void
++parse_cpuinfo(void)
++{
++	int32 fd;
++	uint8 buf[32];
++	int32 idx, n, i;
++
++	idx = 0;
++	fd = runtime·open((int8*)"/proc/cpuinfo", O_RDONLY, 0);
++	if(fd < 0)
++		return;
++	while((n = runtime·read(fd, buf, sizeof buf)) > 0) {
++		for(i = 0; i < n; i++) {
++			if(idx >= 3) {
++				runtime·hwcap |= HWCAP_VFP;
++			}
++			if(idx == 5) { 
++				runtime·hwcap |= HWCAP_VFPv3;
++				goto done;
++			} else {
++				if(buf[i] == vfp[idx])
++					idx++;
++				else
++					idx = 0;
++			}
++		}
++	}
++done:
++	runtime·close(fd);
++}
++
++#pragma textflag NOSPLIT
++static void
++setup_auxv_from_proc(void)
++{
++	int32 auxv_fd;
++	uint32 auxv_entry[2];
++
++	auxv_fd = runtime·open((int8*)"/proc/self/auxv", O_RDONLY, 0);
++	if(auxv_fd < 0) {
++		parse_cpuinfo();
++		return;
++	}
++	while(runtime·read(auxv_fd, auxv_entry, sizeof auxv_entry) == sizeof auxv_entry)
++		parse_auxv_entry(auxv_entry[0], auxv_entry[1]);
++	runtime·close(auxv_fd);
++}
++
++#pragma textflag NOSPLIT
++static void
++setup_auxv_from_argv(int32 argc, byte **argv)
+ {
+ 	byte **envp;
+-	byte *rnd;
+ 	uint32 *auxv;
+-	uint32 t;
+ 
+ 	// skip envp to get to ELF auxiliary vector.
+ 	for(envp = &argv[argc+1]; *envp != nil; envp++)
+@@ -48,28 +123,21 @@
+ 	envp++;
+ 	
+ 	for(auxv=(uint32*)envp; auxv[0] != AT_NULL; auxv += 2) {
+-		switch(auxv[0]) {
+-		case AT_RANDOM: // kernel provided 16-byte worth of random data
+-			if(auxv[1]) {
+-				rnd = (byte*)auxv[1];
+-				runtime·randomNumber = rnd[4] | rnd[5]<<8 | rnd[6]<<16 | rnd[7]<<24;
+-			}
+-			break;
+-		case AT_PLATFORM: // v5l, v6l, v7l
+-			if(auxv[1]) {
+-				t = *(uint8*)(auxv[1]+1);
+-				if(t >= '5' && t <= '7')
+-					runtime·armArch = t - '0';
+-			}
+-			break;
+-		case AT_HWCAP: // CPU capability bit flags
+-			runtime·hwcap = auxv[1];
+-			break;
+-		}
++		parse_auxv_entry(auxv[0], auxv[1]);
+ 	}
+ }
+ 
+ #pragma textflag NOSPLIT
++void
++runtime·setup_auxv(int32 argc, byte **argv)
++{
++	if(argc > 0)
++		setup_auxv_from_argv(argc, argv);
++	else
++		setup_auxv_from_proc();
++}
++
++#pragma textflag NOSPLIT
+ int64
+ runtime·cputicks(void)
+ {
+diff --git a/src/pkg/runtime/proc.c b/src/pkg/runtime/proc.c
+--- a/src/pkg/runtime/proc.c
++++ b/src/pkg/runtime/proc.c
+@@ -66,6 +66,7 @@
+ int32	runtime·gomaxprocs;
+ uint32	runtime·needextram;
+ bool	runtime·iscgo;
++uint8	runtime·islibrary; // set by 5l in shared library mode
+ M	runtime·m0;
+ G	runtime·g0;	 // idle goroutine for m0
+ G*	runtime·allg;
+@@ -169,6 +170,17 @@
+ 
+ static FuncVal initDone = { runtime·unlockOSThread };
+ 
++// Initalize runtime in shared library mode
++extern void runtime·lib_init(void);
++
++// On library mode, _cgo_lib_init is called on first cgo callback
++void *_cgo_lib_init;
++// _cgo_lib_setup is called in library mode to hand cgo the runtime entry point
++void *_cgo_lib_setup;
++// _cgo_lib_init_done is used is used by the runtime in shared library mode to 
++// signal that runtime initialization is done.
++void (*_cgo_lib_init_done)(void*);
++
+ // The main goroutine.
+ void
+ runtime·main(void)
+@@ -213,6 +225,15 @@
+ 	runtime·unlockOSThread();
+ 
+ 	main·main();
++	if(runtime·islibrary) {
++		// Allocate extra m now, because the foreign main program might call into Go
++		// before Go calls any cgo functions.
++		if(runtime·needextram && runtime·cas(&runtime·needextram, 1, 0))
++			runtime·newextram();
++		runtime·asmcgocall(_cgo_lib_init_done, nil);
++		return;
++	}
++
+ 	if(raceenabled)
+ 		runtime·racefini();
+ 
+@@ -697,11 +718,15 @@
+ 	M *mp;
+ 
+ 	if(runtime·needextram) {
+-		// Can happen if C/C++ code calls Go from a global ctor.
+-		// Can not throw, because scheduler is not initialized yet.
+-		runtime·write(2, "fatal error: cgo callback before cgo call\n",
+-			sizeof("fatal error: cgo callback before cgo call\n")-1);
+-		runtime·exit(1);
++		if(runtime·islibrary)
++			runtime·lib_init();
++		if(runtime·needextram) {
++			// Can happen if C/C++ code calls Go from a global ctor.
++			// Can not throw, because scheduler is not initialized yet.
++			runtime·write(2, "fatal error: cgo callback before cgo call\n",
++				sizeof("fatal error: cgo callback before cgo call\n")-1);
++			runtime·exit(1);
++		}
+ 	}
+ 
+ 	// Lock extra list, take head, unlock popped list.
+diff --git a/src/pkg/runtime/rt0_linux_amd64.s b/src/pkg/runtime/rt0_linux_amd64.s
+--- a/src/pkg/runtime/rt0_linux_amd64.s
++++ b/src/pkg/runtime/rt0_linux_amd64.s
+@@ -13,3 +13,9 @@
+ TEXT main(SB),NOSPLIT,$-8
+ 	MOVQ	$_rt0_go(SB), AX
+ 	JMP	AX
++
++TEXT _rt0_amd64_linux_lib(SB),NOSPLIT,$0
++	MOVQ    $_rt0_go(SB), DI
++	MOVQ    _cgo_lib_setup(SB), AX
++	CALL	AX
++	RET
+diff --git a/src/pkg/runtime/rt0_linux_arm.s b/src/pkg/runtime/rt0_linux_arm.s
+--- a/src/pkg/runtime/rt0_linux_arm.s
++++ b/src/pkg/runtime/rt0_linux_arm.s
+@@ -89,3 +89,8 @@
+ 	MOVW	$_rt0_arm_linux1(SB), R4
+ 	B		(R4)
+ 
++TEXT _rt0_arm_linux_lib(SB),NOSPLIT,$0
++	MOVW    $_rt0_arm_linux1(SB), R0
++	MOVW    _cgo_lib_setup(SB), R3
++	BL		(R3)
++	RET
+diff --git a/src/pkg/runtime/runtime.c b/src/pkg/runtime/runtime.c
+--- a/src/pkg/runtime/runtime.c
++++ b/src/pkg/runtime/runtime.c
+@@ -76,6 +76,7 @@
+ Slice syscall·envs;
+ 
+ void (*runtime·sysargs)(int32, uint8**);
++uint8** (*_cgo_getenviron)(void);
+ 
+ void
+ runtime·args(int32 c, uint8 **v)
+@@ -117,13 +118,22 @@
+ {
+ 	String *s;
+ 	int32 i, n;
++	uint8** environ;
+ 
+-	for(n=0; argv[argc+1+n] != 0; n++)
++	environ = nil;
++	if(argc > 0) {
++		environ = argv + argc + 1;
++	} else if(_cgo_getenviron != nil) {
++		environ = _cgo_getenviron();
++	} else
++		runtime·throw("argc is 0");
++
++	for(n=0; environ[n] != nil; n++)
+ 		;
+ 
+ 	s = runtime·malloc(n*sizeof s[0]);
+ 	for(i=0; i<n; i++)
+-		s[i] = runtime·gostringnocopy(argv[argc+1+i]);
++		s[i] = runtime·gostringnocopy(environ[i]);
+ 	syscall·envs.array = (byte*)s;
+ 	syscall·envs.len = n;
+ 	syscall·envs.cap = n;
+diff --git a/src/pkg/runtime/runtime.h b/src/pkg/runtime/runtime.h
+--- a/src/pkg/runtime/runtime.h
++++ b/src/pkg/runtime/runtime.h
+@@ -711,6 +711,7 @@
+ extern	int8*	runtime·goos;
+ extern	int32	runtime·ncpu;
+ extern	bool	runtime·iscgo;
++extern	bool	runtime·islibrary;
+ extern 	void	(*runtime·sysargs)(int32, uint8**);
+ extern	uintptr	runtime·maxstring;
+ extern	uint32	runtime·Hchansize;
+diff --git a/src/pkg/runtime/softfloat_arm.c b/src/pkg/runtime/softfloat_arm.c
+--- a/src/pkg/runtime/softfloat_arm.c
++++ b/src/pkg/runtime/softfloat_arm.c
+@@ -202,6 +202,16 @@
+ 			runtime·printf("*** cpu PC += %x\n", (delta+2)*4);
+ 		return delta+2;
+ 	}
++	if(runtime·islibrary && i == 0xe08fb00b) {
++		// ADD PC, R11
++		// In shared library mode, addresses in the instruction
++		// stream are pc-relative, and the linker inserts
++		// this instruction to convert to absolute addresses.
++		regs[11] = (uint32)((uint8*)pc + regs[11] + 8);
++		if(trace)
++			runtime·printf("*** cpu R[%d] += PC\n", 11);
++		return 1;
++	}
+ 
+ 	goto stage1;
+ 
+diff --git a/src/pkg/runtime/vdso_linux_amd64.c b/src/pkg/runtime/vdso_linux_amd64.c
+--- a/src/pkg/runtime/vdso_linux_amd64.c
++++ b/src/pkg/runtime/vdso_linux_amd64.c
+@@ -299,10 +299,26 @@
+ }
+ 
+ static void
+-runtime·linux_setup_vdso(int32 argc, uint8** argv)
+-{
++parse_auxv_entry(uint64 type, uint64 val) {
+ 	struct vdso_info vdso_info;
+ 
++	if(type == AT_SYSINFO_EHDR) {
++		if(val == 0) {
++			// Something went wrong
++			return;
++		}
++		vdso_init_from_sysinfo_ehdr(&vdso_info, (Elf64_Ehdr*)val);
++		vdso_parse_symbols(&vdso_info, vdso_find_version(&vdso_info, &linux26));
++	}
++	if(type == AT_RANDOM) {
++		runtime·startup_random_data = (byte*)val;
++		runtime·startup_random_data_len = 16;
++	}
++}
++
++static void
++parse_auxv_from_argv(int32 argc, uint8** argv)
++{
+ 	// skip argvc
+ 	byte **p = argv;
+ 	p = &p[argc+1];
+@@ -317,21 +333,32 @@
+ 	Elf64_auxv_t *elf_auxv = (Elf64_auxv_t*) p;
+ 
+ 	for(int32 i=0; elf_auxv[i].a_type!=AT_NULL; i++) {
+-		if(elf_auxv[i].a_type == AT_SYSINFO_EHDR) {
+-			if(elf_auxv[i].a_un.a_val == 0) {
+-				// Something went wrong
+-				continue;
+-			}
+-			vdso_init_from_sysinfo_ehdr(&vdso_info, (Elf64_Ehdr*)elf_auxv[i].a_un.a_val);
+-			vdso_parse_symbols(&vdso_info, vdso_find_version(&vdso_info, &linux26));
+-			continue;
+-		}
+-		if(elf_auxv[i].a_type == AT_RANDOM) {
+-		        runtime·startup_random_data = (byte*)elf_auxv[i].a_un.a_val;
+-		        runtime·startup_random_data_len = 16;
+-			continue;
+-		}
++		parse_auxv_entry(elf_auxv[i].a_type, elf_auxv[i].a_un.a_val);
+ 	}
+ }
+ 
+-void (*runtime·sysargs)(int32, uint8**) = runtime·linux_setup_vdso;
++static void
++parse_auxv_from_proc(void)
++{
++	int32 auxv_fd;
++	uint64 auxv_entry[2];
++
++	auxv_fd = runtime·open("/proc/self/auxv", 0 /* O_RDONLY */, 0);
++	if(auxv_fd < 0)
++		return;
++	while(runtime·read(auxv_fd, auxv_entry, sizeof auxv_entry) == sizeof auxv_entry) {
++		parse_auxv_entry(auxv_entry[0], auxv_entry[1]);
++	}
++	runtime·close(auxv_fd);
++}
++
++static void
++parse_auxv(int32 argc, uint8** argv)
++{
++	if(argc > 0)
++		parse_auxv_from_argv(argc, argv);
++	else
++		parse_auxv_from_proc();
++}
++
++void (*runtime·sysargs)(int32, uint8**) = parse_auxv;
+diff --git a/src/run.bash b/src/run.bash
+--- a/src/run.bash
++++ b/src/run.bash
+@@ -135,6 +135,20 @@
+ ) || exit $?
+ 
+ [ "$CGO_ENABLED" != 1 ] ||
++(xcd ../misc/cgo/testshared
++set -e
++# Shared library tests are only run on linux/arm, because
++# only ARM supports building shared libraries without special
++# build flags to gc and cc
++case "$GOHOSTOS-$GOOS-$GOARCH-$CGO_ENABLED" in
++linux-linux-arm-1)
++	echo
++	echo '# Testing go shared libraries.'
++	./test.bash
++esac
++) || exit $?
++
++[ "$CGO_ENABLED" != 1 ] ||
+ [ "$GOHOSTOS" == windows ] ||
+ (xcd ../misc/cgo/testso
+ ./test.bash || exit 1

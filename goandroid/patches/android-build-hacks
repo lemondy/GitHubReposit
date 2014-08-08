@@ -1,0 +1,173 @@
+# HG changeset patch
+# Parent 885d86446b1fee0b26a11b928f2e407b4acb1645
+
+diff -r 885d86446b1f src/cmd/go/build.go
+--- a/src/cmd/go/build.go	Wed Sep 11 22:42:53 2013 +0200
++++ b/src/cmd/go/build.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -1866,7 +1866,19 @@
+ 		case "windows":
+ 			a = append(a, "-mthreads")
+ 		default:
+-			a = append(a, "-pthread")
++			isAndroid := 0
++			for _, v := range buildContext.BuildTags {
++				if v == "android" {
++					isAndroid = 1
++					break
++				}
++			}
++			if isAndroid != 1 {
++				isAndroid = -1
++			}
++			if isAndroid < 0 {
++				a = append(a, "-pthread")
++			}
+ 		}
+ 	}
+ 
+@@ -1913,10 +1925,6 @@
+ )
+ 
+ func (b *builder) cgo(p *Package, cgoExe, obj string, gccfiles []string, gxxfiles []string) (outGo, outObj []string, err error) {
+-	if goos != toolGOOS {
+-		return nil, nil, errors.New("cannot use cgo when compiling for a different operating system")
+-	}
+-
+ 	cgoCPPFLAGS := stringList(envList("CGO_CPPFLAGS"), p.CgoCPPFLAGS)
+ 	cgoCFLAGS := stringList(envList("CGO_CFLAGS"), p.CgoCFLAGS)
+ 	cgoCXXFLAGS := stringList(envList("CGO_CXXFLAGS"), p.CgoCXXFLAGS)
+diff -r 885d86446b1f src/pkg/os/file_android.go
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/pkg/os/file_android.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -0,0 +1,16 @@
++// Copyright 2012 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build android,linux
++
++package os
++
++// TempDir returns the default directory to use for temporary files.
++func TempDir() string {
++	dir := Getenv("TMPDIR")
++	if dir == "" {
++		dir = "/data/local/tmp"
++	}
++	return dir
++}
+diff -r 885d86446b1f src/pkg/os/file_non_android.go
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/pkg/os/file_non_android.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -0,0 +1,16 @@
++// Copyright 2012 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build darwin freebsd !android,linux netbsd openbsd
++
++package os
++
++// TempDir returns the default directory to use for temporary files.
++func TempDir() string {
++	dir := Getenv("TMPDIR")
++	if dir == "" {
++		dir = "/tmp"
++	}
++	return dir
++}
+diff -r 885d86446b1f src/pkg/os/file_unix.go
+--- a/src/pkg/os/file_unix.go	Wed Sep 11 22:42:53 2013 +0200
++++ b/src/pkg/os/file_unix.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -281,12 +281,3 @@
+ 
+ 	return name
+ }
+-
+-// TempDir returns the default directory to use for temporary files.
+-func TempDir() string {
+-	dir := Getenv("TMPDIR")
+-	if dir == "" {
+-		dir = "/tmp"
+-	}
+-	return dir
+-}
+diff -r 885d86446b1f src/pkg/os/user/lookup_stubs.go
+--- a/src/pkg/os/user/lookup_stubs.go	Wed Sep 11 22:42:53 2013 +0200
++++ b/src/pkg/os/user/lookup_stubs.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-// +build !cgo,!windows,!plan9
++// +build !cgo,!windows,!plan9 android
+ 
+ package user
+ 
+diff -r 885d86446b1f src/pkg/os/user/lookup_unix.go
+--- a/src/pkg/os/user/lookup_unix.go	Wed Sep 11 22:42:53 2013 +0200
++++ b/src/pkg/os/user/lookup_unix.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-// +build darwin dragonfly freebsd linux netbsd openbsd
++// +build darwin dragonfly freebsd !android,linux netbsd openbsd
+ // +build cgo
+ 
+ package user
+diff -r 885d86446b1f src/pkg/runtime/cgo/cgo.go
+--- a/src/pkg/runtime/cgo/cgo.go	Wed Sep 11 22:42:53 2013 +0200
++++ b/src/pkg/runtime/cgo/cgo.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -9,19 +9,6 @@
+ */
+ package cgo
+ 
+-/*
+-
+-#cgo darwin LDFLAGS: -lpthread
+-#cgo dragonfly LDFLAGS: -lpthread
+-#cgo freebsd LDFLAGS: -lpthread
+-#cgo linux LDFLAGS: -lpthread
+-#cgo netbsd LDFLAGS: -lpthread
+-#cgo openbsd LDFLAGS: -lpthread
+-#cgo windows LDFLAGS: -lm -mthreads
+-
+-#cgo CFLAGS: -Wall -Werror
+-
+-*/
+ import "C"
+ 
+ // Supports _cgo_panic by converting a string constant to an empty
+diff -r 885d86446b1f src/pkg/runtime/cgo/cgo_flags.go
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/pkg/runtime/cgo/cgo_flags.go	Wed Sep 11 22:50:28 2013 +0200
+@@ -0,0 +1,16 @@
++// Copyright 2012 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package cgo
++
++/*
++#cgo darwin LDFLAGS: -lpthread
++#cgo freebsd LDFLAGS: -lpthread
++#cgo linux,!android LDFLAGS: -lpthread
++#cgo linux,android LDFLAGS: -llog
++#cgo netbsd LDFLAGS: -lpthread
++#cgo openbsd LDFLAGS: -lpthread
++#cgo windows LDFLAGS: -lm -mthreads
++*/
++import "C"
+diff -r 885d86446b1f src/pkg/runtime/malloc.goc
+--- a/src/pkg/runtime/malloc.goc	Wed Sep 11 22:42:53 2013 +0200
++++ b/src/pkg/runtime/malloc.goc	Wed Sep 11 22:50:28 2013 +0200
+@@ -316,7 +316,7 @@
+ 
+ uintptr runtime·sizeof_C_MStats = sizeof(MStats);
+ 
+-#define MaxArena32 (2U<<30)
++#define MaxArena32 (2U<<28)
+ 
+ void
+ runtime·mallocinit(void)

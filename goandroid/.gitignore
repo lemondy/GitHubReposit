@@ -1,0 +1,20 @@
+#VIM cache files
+*~
+
+# OS X noise
+.DS_Store
+
+*.pyc
+*.swp
+*.mo
+*/build
+bin
+pkg
+*/android/pkg
+*/android/bin
+*/android/gen
+*/android/obj
+*/android/libs
+*/android/local.properties
+/go
+/ndk-toolchain

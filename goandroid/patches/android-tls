@@ -1,0 +1,210 @@
+# HG changeset patch
+# Parent 4ca1bf670de5268db946674716e87bdb65a5de4f
+
+diff -r 4ca1bf670de5 src/cmd/5l/asm.c
+--- a/src/cmd/5l/asm.c	Tue Aug 13 17:12:09 2013 +0200
++++ b/src/cmd/5l/asm.c	Tue Aug 13 17:38:47 2013 +0200
+@@ -961,7 +961,7 @@
+ 			rel->siz = 4;
+ 			rel->sym = p->to.sym;
+ 			rel->add = p->to.offset;
+-			if(rel->sym == gmsym) {
++			if(!flag_no_tls && rel->sym == gmsym) {
+ 				rel->type = D_TLS;
+ 				if(flag_shared)
+ 					rel->add += pc - p->pcrel->pc - 8 - rel->siz;
+diff -r 4ca1bf670de5 src/cmd/5l/l.h
+--- a/src/cmd/5l/l.h	Tue Aug 13 17:12:09 2013 +0200
++++ b/src/cmd/5l/l.h	Tue Aug 13 17:38:47 2013 +0200
+@@ -324,6 +324,7 @@
+ EXTERN	int	goarm;
+ EXTERN	Sym*	adrgotype;	// type symbol on last Adr read
+ EXTERN	Sym*	fromgotype;	// type symbol on last p->from read
++EXTERN	int flag_no_tls;
+ 
+ extern	char*	anames[];
+ extern	Optab	optab[];
+diff -r 4ca1bf670de5 src/cmd/5l/obj.c
+--- a/src/cmd/5l/obj.c	Tue Aug 13 17:12:09 2013 +0200
++++ b/src/cmd/5l/obj.c	Tue Aug 13 17:38:47 2013 +0200
+@@ -93,6 +93,7 @@
+ 		debug['F'] = 1;
+ 
+ 	flagcount("1", "use alternate profiling code", &debug['1']);
++	flagcount("android", "disable TLS relocations", &flag_no_tls);
+ 	flagfn1("B", "info: define ELF NT_GNU_BUILD_ID note", addbuildinfo);
+ 	flagstr("E", "sym: entry symbol", &INITENTRY);
+ 	flagint32("D", "addr: data address", &INITDAT);
+@@ -257,6 +258,12 @@
+ 
+ 	addlibpath("command line", "command line", argv[0], "main");
+ 	loadlib();
++	if(flag_no_tls) {
++		s = lookup("runtime.tlsgm", 0);
++		s->type = SBSS;
++		s->size = PtrSize;
++		s->hide = 0;
++	}
+ 
+ 	// mark some functions that are only referenced after linker code editing
+ 	if(debug['F'])
+diff -r 4ca1bf670de5 src/cmd/ld/symtab.c
+--- a/src/cmd/ld/symtab.c	Tue Aug 13 17:12:09 2013 +0200
++++ b/src/cmd/ld/symtab.c	Tue Aug 13 17:38:47 2013 +0200
+@@ -182,13 +182,15 @@
+ 	
+ 	if(linkmode == LinkExternal && HEADTYPE != Hopenbsd) {
+ 		s = lookup("runtime.tlsgm", 0);
+-		if(s->sect == nil) {
+-			cursym = nil;
+-			diag("missing section for %s", s->name);
+-			errorexit();
++		if(s->type == STLSBSS) {
++			if(s->sect == nil) {
++				cursym = nil;
++				diag("missing section for %s", s->name);
++				errorexit();
++			}
++			putelfsyment(putelfstr(s->name), 0, 2*PtrSize, (STB_LOCAL<<4)|STT_TLS, s->sect->elfsect->shnum, 0);
++			s->elfsym = numelfsym++;
+ 		}
+-		putelfsyment(putelfstr(s->name), 0, 2*PtrSize, (STB_LOCAL<<4)|STT_TLS, s->sect->elfsect->shnum, 0);
+-		s->elfsym = numelfsym++;
+ 	}
+ 
+ 	elfbind = STB_GLOBAL;
+diff -r 4ca1bf670de5 src/pkg/runtime/cgo/cgo_android_arm.c
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/pkg/runtime/cgo/cgo_android_arm.c	Tue Aug 13 17:38:47 2013 +0200
+@@ -0,0 +1,12 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build android
++#include "../runtime.h"
++#include "../cgocall.h"
++
++#pragma cgo_import_static x_cgo_tls_setup
++extern void x_cgo_tls_setup(void (*)(void*));
++void (*_cgo_tls_setup)(void (*)(void*)) = x_cgo_tls_setup;
++
+diff -r 4ca1bf670de5 src/pkg/runtime/cgo/gcc_android_arm.c
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/pkg/runtime/cgo/gcc_android_arm.c	Tue Aug 13 17:38:47 2013 +0200
+@@ -0,0 +1,88 @@
++// Copyright 2009 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build android
++
++// cgo glue for setting up TLS in case the host linker does not support
++// TLS relocations
++
++#include <pthread.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h> // strerror
++#include <android/log.h>
++#include "libcgo.h"
++
++static pthread_key_t k1;
++static pthread_key_t k2;
++
++#define magic1 (0xdeadbeefU)
++#define magic2 (0x23581321U)
++
++void
++x_cgo_tls_setup(void **tlsoffset, void **tlsbase)
++{
++	pthread_key_t tofree[50], prev_k, k;
++	int i, ntofree;
++	void **tls1, **tls2;
++
++	// tlsbase is the tls base address used by runtime.save_gm
++	// and runtime.load_gm. They offset the base address with 8,
++	// so we'll do that too.
++	tlsbase = (void **)(((char *)tlsbase) + 8);
++	/*
++	 * Allocate thread-local storage slots for m, g.
++	 *
++	 * The linux linker use R_ARM_TLS_IE32 relocations to puts the TLS
++	 * offset for our TLS space into runtime.tlsgm. However, the Android
++	 * linker does not support TLS relocations, so we'll mimic the linker
++	 * by finding two consecutive TLS slots with pthread_key_create and
++	 * assign the offset from the TLS base to runtime.tlsgm.
++	 */
++	if(pthread_key_create(&prev_k, nil) != 0) {
++		__android_log_print(ANDROID_LOG_ERROR, "Go runtime", "runtime/cgo: pthread_key_create failed");
++		abort();
++	}
++	ntofree = 0;
++	while(1) {
++		if(pthread_key_create(&k, nil) != 0) {
++			__android_log_print(ANDROID_LOG_ERROR, "Go runtime", "runtime/cgo: pthread_key_create failed");
++			abort();
++		}
++		pthread_setspecific(prev_k, (void*)magic1);
++		pthread_setspecific(k, (void*)magic2);
++		for(i=0; i<nelem(tofree); i++) {
++			tls1 = tlsbase + i;
++			tls2 = tlsbase + i + 1;
++			if((*tls1 == (void*)magic1 && *tls2 == (void*)magic2) ||
++				(*tls1 == (void*)magic2 && *tls2 == (void*)magic1)) {
++				k1 = prev_k;
++				k2 = k;
++				*tlsoffset = (void*)(i*sizeof(void *));
++				goto done;
++			}
++		}
++		pthread_setspecific(prev_k, 0);
++		pthread_setspecific(k, 0);
++		if(ntofree >= nelem(tofree)) {
++			__android_log_print(ANDROID_LOG_ERROR, "Go runtime", "runtime/cgo: could not obtain pthread_keys");
++			__android_log_print(ANDROID_LOG_ERROR, "Go runtime", "runtime/cgo: tried:");
++			for(i=0; i<ntofree; i++)
++				__android_log_print(ANDROID_LOG_ERROR, "Go runtime", " %#x", (unsigned)tofree[i]);
++			abort();
++		}
++		tofree[ntofree++] = prev_k;
++		prev_k = k;
++	}
++
++done:
++	pthread_setspecific(prev_k, 0);
++	pthread_setspecific(k, 0);
++
++	/*
++	 * We got the keys we wanted.  Free the others.
++	 */
++	for(i=0; i<ntofree; i++)
++		pthread_key_delete(tofree[i]);
++}
+diff -r 4ca1bf670de5 src/pkg/runtime/rt0_linux_arm.s
+--- a/src/pkg/runtime/rt0_linux_arm.s	Tue Aug 13 17:12:09 2013 +0200
++++ b/src/pkg/runtime/rt0_linux_arm.s	Tue Aug 13 17:38:47 2013 +0200
+@@ -86,6 +86,12 @@
+ 	B		(R4)
+ 
+ TEXT _rt0_arm_linux_lib(SB),NOSPLIT,$0
++	MRC		15, 0, R1, C13, C0, 3 // Fetch TLS register
++	MOVW	_cgo_tls_setup(SB), R3
++	CMP		$0, R3
++	MOVW.NE	$runtime·tlsgm(SB), R0
++	BL.NE	(R3)
++
+ 	MOVW    $_rt0_arm_linux1(SB), R0
+ 	MOVW    _cgo_lib_setup(SB), R3
+ 	BL		(R3)
+diff -r 4ca1bf670de5 src/pkg/runtime/runtime.c
+--- a/src/pkg/runtime/runtime.c	Tue Aug 13 17:12:09 2013 +0200
++++ b/src/pkg/runtime/runtime.c	Tue Aug 13 17:38:47 2013 +0200
+@@ -77,6 +77,7 @@
+ 
+ void (*runtime·sysargs)(int32, uint8**);
+ uint8** (*_cgo_getenviron)(void);
++void *_cgo_tls_setup;
+ 
+ void
+ runtime·args(int32 c, uint8 **v)
