@@ -1,0 +1,21 @@
+go
+go test
+go test -test.branch=.*
+go test -cover
+go install
+go get
+go clean
+go env
+go version
+go build
+go build -ldflags "
+go build -ldflags "-r ."
+go build -ldflags "-H windowsgui"
+go build -ldflags "-H windowsgui -r ."
+go build -ldflags "-w -s"
+go build -gcflags "
+gopm --noterm get
+gopm --noterm install
+gopm --noterm build
+gopm --noterm bin
+gopm --noterm help
